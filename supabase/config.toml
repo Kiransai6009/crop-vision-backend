@@ -1,0 +1,4 @@
+project_id = "udylcriijgnkwxngtgoa"
+
+[functions.helpdesk-chat]
+verify_jwt = false

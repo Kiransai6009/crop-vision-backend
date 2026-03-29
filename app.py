@@ -32,18 +32,80 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import requests
 import numpy as np
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.preprocessing import StandardScaler
 from dotenv import load_dotenv
+import jwt
+from functools import wraps
+from supabase import create_client, Client
+
+from ml_model import predict_yield
+from ndvi import calculate_ndvi, get_live_ndvi
 
 load_dotenv()
 
+# --- Config and Supabase Initialization ---
+SUPABASE_URL = os.getenv("SUPABASE_URL", "")
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
+SUPABASE_JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET", "")
+
+supabase = None
+if SUPABASE_URL and SUPABASE_SERVICE_KEY:
+    try:
+        supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+    except Exception as e:
+        print(f"Supabase init error: {e}")
+
 app = Flask(__name__)
 # Enable CORS for all routes and origins
-CORS(app, resources={r"/api/*": {"origins": "*"}})
+CORS(app)
 
 # --- Configuration & Keys ---
 OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY", "")
+history_store = []
+
+@app.route("/api/health")
+def health_check():
+    return jsonify({"status": "healthy", "service": "Crop Intelligence Backend", "version": "2.0.0"})
+
+@app.route("/api/faq")
+def get_mock_faq():
+    return jsonify([
+        {"id": "1", "question": "What is Crop Intelligence?", "answer": "Advanced AI for harvest optimization.", "category": "General"},
+        {"id": "2", "question": "Is satellite data real-time?", "answer": "Yes, updated every 5-10 days via Sentinel-2.", "category": "Technical"}
+    ])
+
+def save_prediction(user_id, crop, ndvi, yield_result):
+    if supabase:
+        try:
+            supabase.table("predictions").insert({
+                "user_id": user_id,
+                "crop": crop,
+                "ndvi_value": float(ndvi),
+                "predicted_yield": float(yield_result),
+                # omitted 'id' and 'created_at' as Supabase will generate them automatically if set in DB default, 
+                # but if user constraints specifically mention them: "columns: id, user_id, crop, ndvi_value, predicted_yield, created_at".
+                # Supabase handles UUID and timestamps via default values, so usually we don't pass them explicitly, but I'll add them if needed. (I'll let DB handle defaults)
+            }).execute()
+        except Exception as e:
+            print(f"Supabase insert error: {e}")
+
+def require_auth(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        auth_header = request.headers.get('Authorization')
+        if not auth_header or not auth_header.startswith('Bearer '):
+            return jsonify({"error": "Unauthorized, missing token"}), 401
+        
+        token = auth_header.split(' ')[1]
+        try:
+            # We skip audience here for compatibility, or check 'authenticated'
+            payload = jwt.decode(token, SUPABASE_JWT_SECRET, algorithms=["HS256"], options={"verify_audience": False})
+            request.user = payload
+        except jwt.ExpiredSignatureError:
+            return jsonify({"error": "Token has expired"}), 401
+        except Exception as e:
+            return jsonify({"error": "Invalid token", "message": str(e)}), 401
+        return f(*args, **kwargs)
+    return decorated
 history_store = []
 
 # --- Location Database ---
@@ -103,27 +165,7 @@ LOCATIONS = {
     }
 }
 
-# --- ML Model Setup ---
-def train_yield_model():
-    np.random.seed(42)
-    n_samples = 1000
-    ndvi = np.random.uniform(0.1, 0.9, n_samples)
-    temp = np.random.uniform(15, 40, n_samples)
-    rain = np.random.uniform(20, 300, n_samples)
-    hum  = np.random.uniform(30, 90, n_samples)
-    moist = np.random.uniform(0.1, 0.8, n_samples)
-    
-    y = (4.5 * ndvi - 0.05 * np.abs(temp - 28)**1.5 + 0.012 * rain + 0.015 * hum + 2.0 * moist + np.random.normal(0, 0.3, n_samples))
-    y = np.clip(y, 0.5, 12)
-    
-    X = np.column_stack([ndvi, temp, rain, hum, moist])
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
-    model = RandomForestRegressor(n_estimators=100, max_depth=8, random_state=42)
-    model.fit(X_scaled, y)
-    return model, scaler
-
-MODEL, SCALER = train_yield_model()
+# Removed dynamic ML training, importing from ml_model.py
 
 # --- Helpers ---
 def stable_rand(seed_str: str, lo: float, hi: float) -> float:
@@ -204,6 +246,10 @@ def get_health_status(ndvi):
 
 # --- ROUTES ---
 
+@app.route("/", methods=["GET"])
+def index():
+    return "Crop Yield Prediction Backend Running"
+
 @app.route("/api/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok", "message": "CropVision Unified API is running"})
@@ -232,14 +278,19 @@ def get_dashboard():
     moist = compute_soil_moisture(w["temperature"], w["humidity"], w["rainfall"])
     
     # Predict
-    X = np.array([[ndvi, w["temperature"], w["rainfall"], w["humidity"], moist]])
-    pred = MODEL.predict(SCALER.transform(X))[0]
+    pred = predict_yield(ndvi, w["rainfall"], w["temperature"], w["humidity"])
     
     h = get_health_status(ndvi)
     
     crop = request.args.get("crop", default="Mixed")
     
+    # Return hybrid payload for both the specified requirement and exact frontend needs
     return jsonify({
+        "crop_health": h["status"],
+        "ndvi_value": ndvi,
+        "rainfall": w["rainfall"],
+        "temperature": w["temperature"],
+        "humidity": w["humidity"],
         "location": {"lat": lat, "lon": lon, "name": request.args.get("name", "Selected"), "crop": crop},
         "weather": {**w, "feels_like": w["temperature"], "wind_speed": 12, "pressure": 1013},
         "ndvi": {"current": ndvi, "soil_moisture": moist, "trend": get_ndvi_trend(lat, lon)},
@@ -249,24 +300,73 @@ def get_dashboard():
         "generated_at": datetime.now().isoformat()
     })
 
+@app.route("/ndvi", methods=["POST"])
+@require_auth
+def api_ndvi_live():
+    data = request.get_json() or {}
+    lat = data.get("lat")
+    lon = data.get("lon")
+    start = data.get("start")
+    end = data.get("end")
+    
+    if lat is None or lon is None or start is None or end is None:
+        return jsonify({"error": "Missing parameters. Need lat, lon, start, end"}), 400
+
+    # Local file-based caching
+    cache_file = "ndvi_cache.json"
+    cache_key = f"{lat}_{lon}_{start}_{end}"
+    
+    if os.path.exists(cache_file):
+        try:
+            with open(cache_file, "r") as f:
+                cache_data = json.load(f)
+                if cache_key in cache_data:
+                    return jsonify({"mean_ndvi": cache_data[cache_key]["ndvi"], "source": "cache"})
+        except Exception as e:
+            print(f"Cache read error: {e}")
+
+    # Fetch live NDVI
+    result = get_live_ndvi(lat, lon, start, end)
+    
+    # Save to Cache
+    try:
+        cache_data = {}
+        if os.path.exists(cache_file):
+            with open(cache_file, "r") as f:
+                cache_data = json.load(f)
+        
+        cache_data[cache_key] = {"ndvi": result["ndvi"], "source": result["source"], "cached_at": datetime.now().isoformat()}
+        with open(cache_file, "w") as f:
+            json.dump(cache_data, f)
+    except Exception as e:
+        print(f"Cache write error: {e}")
+
+    return jsonify({"mean_ndvi": result["ndvi"], "source": result["source"]})
+
 @app.route("/api/predict", methods=["POST"])
+@require_auth
 def api_predict():
     data = request.get_json() or {}
     rain = float(data.get("rainfall", 100))
     temp = float(data.get("temperature", 28))
     hum  = float(data.get("humidity", 65))
     ndvi = float(data.get("ndvi", 0.5))
+    crop = data.get("crop", "Unknown")
     
     moist = compute_soil_moisture(temp, hum, rain)
-    X = np.array([[ndvi, temp, rain, hum, moist]])
-    pred = MODEL.predict(SCALER.transform(X))[0]
+    pred = predict_yield(ndvi, rain, temp, hum)
     
     h = get_health_status(ndvi)
+    
+    # Save to supabase
+    user_id = request.user.get("sub")
+    if user_id:
+        save_prediction(user_id, crop, ndvi, round(pred, 2))
+    
+    # Modified to match specified JSON requirement precisely
     return jsonify({
-        "ndvi": ndvi,
         "predicted_yield": round(pred, 2),
-        "crop_status": h["status"],
-        "confidence": 85
+        "confidence": 85.0
     })
 
 @app.route("/api/profit", methods=["POST"])
@@ -284,6 +384,23 @@ def api_profit():
         "total_cost": round(cost, 2),
         "net_profit": round(income - cost, 2)
     })
+
+@app.route("/history", methods=["GET"])
+@require_auth
+def get_history_route():
+    # User requested: "Add a GET /history route that fetches the last 10 predictions for the authenticated user from Supabase"
+    user_id = request.user.get("sub")
+    if supabase and user_id:
+        try:
+            resp = supabase.table("predictions").select("*").eq("user_id", user_id).order("created_at", desc=True).limit(10).execute()
+            return jsonify(resp.data)
+        except Exception as e:
+            print(f"Supabase History Error (Falling back): {e}")
+            # Fallback to local store
+    
+    # Fallback/Local Intelligence if Supabase unreachable
+    user_history = [entry for entry in history_store if entry.get("user_id") == user_id]
+    return jsonify(user_history[-10:])
 
 @app.route("/api/history", methods=["GET", "POST"])
 def api_history():
@@ -304,6 +421,69 @@ def api_fertilizer():
         recs = [{"name": "NPK", "dose": "60kg/ha"}]
     return jsonify({"recommendations": recs})
 
+# --- AI CHAT ASSISTANT ---
+
+@app.route("/api/chat", methods=["POST"])
+def api_chat():
+    data = request.get_json() or {}
+    messages = data.get("messages", [])
+    
+    # SYSTEM PROMPT
+    system_prompt = (
+        "You are the CropVision AI Assistant. You help farmers and researchers understand "
+        "crop yield predictions, NDVI spectral data, and weather impacts. "
+        "Knowledge areas: Rice, Cotton, Chilli, Groundnut, Sugarcane, Grapes, Wheat, Turmeric. "
+        "Tone: Helpful, professional, concise. Use markdown for lists or bold text."
+    )
+
+    # 1. Check for Gemini Key
+    gemini_key = os.getenv("GOOGLE_API_KEY")
+    if gemini_key:
+        try:
+            # Simple direct API call to Gemini (non-streaming for simplicity in this bridge)
+            # You can also use 'google-generativeai' library if it's in requirements
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={gemini_key}"
+            headers = {"Content-Type": "application/json"}
+            
+            # Format history for Gemini
+            contents = []
+            for m in messages:
+                role = "user" if m["role"] == "user" else "model"
+                contents.append({"role": role, "parts": [{"text": m["content"]}]})
+            
+            # Prepend system instruction as a user message if needed, or use specific param
+            body = {
+                "contents": contents,
+                "system_instruction": {"parts": [{"text": system_prompt}]}
+            }
+            
+            resp = requests.post(url, headers=headers, json=body, timeout=10)
+            if resp.ok:
+                result = resp.json()
+                text = result["candidates"][0]["content"]["parts"][0]["text"]
+                return jsonify({"role": "assistant", "content": text})
+        except Exception as e:
+            print(f"Gemini error: {e}")
+
+    # 2. Fallback Intelligence (If Key missing or error)
+    user_msg = messages[-1]["content"].lower() if messages else ""
+    
+    # Basic Rule-based Fallback
+    if any(k in user_msg for k in ["hello", "hi", "who are you"]):
+        reply = "Hello! I am your CropVision Assistant. How can I help you with your agriculture data today?"
+    elif "ndvi" in user_msg:
+        reply = "Normalized Difference Vegetation Index (NDVI) measures plant health by comparing reflected Red and Near-Infrared light. Healthy plants reflect more NIR. In CropVision, anything above 0.6 is considered healthy vegetation."
+    elif any(k in user_msg for k in ["yield", "prediction", "predict"]):
+        reply = "I use a Random Forest Regression model to predict yields. It takes into account your local Rainfall, Temperature, Humidity, and satellite-derived NDVI values."
+    elif "weather" in user_msg:
+        reply = "I integrate live data from Open-Meteo to provide real-time updates on temperature and precipitation for your specific coordinates."
+    elif "crop" in user_msg:
+        reply = "CropVision currently supports a wide variety of Indian crops including Rice, Cotton, Sugarcane, Wheat, and specialized crops like Turmeric and Orange depending on your selected state."
+    else:
+        reply = "That's an interesting question! While I'm in fallback mode, I can specifically help you with details about **NDVI analysis**, **Yield Predictions**, or **Weather Integration**. What would you like to know more about?"
+
+    return jsonify({"role": "assistant", "content": reply})
+
 @app.route("/api/risk", methods=["POST"])
 def api_risk():
     data = request.get_json() or {}
@@ -311,6 +491,45 @@ def api_risk():
     alerts = []
     if rain < 50: alerts.append({"type":"Drought", "severity":"Critical"})
     return jsonify({"risk_count": len(alerts), "alerts": alerts})
+
+# --- Passwords & Security ---
+MOCK_TOKENS = {}
+
+@app.route("/forgot-password", methods=["POST"])
+def forgot_password():
+    data = request.get_json() or {}
+    email = data.get("email")
+    if not email:
+        return jsonify({"error": "Email is required"}), 400
+    
+    # In real app: Check if email exists in DB
+    # Generate secure token
+    token = hashlib.sha256(str(uuid.uuid4()).encode()).hexdigest()
+    MOCK_TOKENS[token] = email
+    
+    # Real app: Send email with: http://localhost:8081/reset-password?token=token
+    print(f"PASSWORD RESET LINK: http://localhost:8081/reset-password?token={token}")
+    
+    return jsonify({"message": "Password reset link sent to your email", "token_preview_for_dev": token})
+
+@app.route("/reset-password", methods=["POST"])
+def reset_password():
+    data = request.get_json() or {}
+    token = data.get("token")
+    new_password = data.get("new_password")
+    
+    if not token or not new_password:
+        return jsonify({"error": "Missing token or new_password"}), 400
+    
+    if token not in MOCK_TOKENS:
+        return jsonify({"error": "Invalid or expired token"}), 400
+    
+    email = MOCK_TOKENS.pop(token)
+    
+    # Real app: Update password in DB
+    print(f"Updating password for {email} to {new_password}")
+    
+    return jsonify({"message": "Password updated successfully"})
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))

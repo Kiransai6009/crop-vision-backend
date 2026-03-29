@@ -8,3 +8,6 @@ pandas
 matplotlib
 scipy
 gunicorn
+earthengine-api
+supabase
+PyJWT

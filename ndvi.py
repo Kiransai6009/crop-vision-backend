@@ -13,8 +13,11 @@ def query_gee_ndvi(lat, lon, start_date, end_date):
     Query Sentinel-2 Surface Reflectance imagery for NDVI and return mean score
     """
     try:
-        if not ee.data._credentials:
+        # Re-ensure initialization if needed, though typically handled at module load
+        try:
             ee.Initialize()
+        except Exception:
+            pass
         
         point = ee.Geometry.Point([lon, lat])
         collection = (ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")

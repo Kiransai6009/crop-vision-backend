@@ -9,5 +9,7 @@ matplotlib
 scipy
 gunicorn
 earthengine-api
-supabase
 PyJWT
+pymongo
+dnspython
+bcrypt
